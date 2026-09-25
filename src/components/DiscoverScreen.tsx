@@ -1,7 +1,8 @@
-import React, { useState } from "react";
+import React, { useState, useMemo } from "react";
 import { Search, SlidersHorizontal, Loader2, AlertCircle, Compass, X } from "lucide-react";
 import { CreatorCard } from "./CreatorCard";
 import { Creator, ApiResponse, ApiError } from "../types";
+import { normalizeResult } from "../lib/normalizeCreator";
 
 interface DiscoverScreenProps {
   isStarred: (creator: Creator) => boolean;
@@ -17,6 +18,13 @@ const PRESET_QUERIES = [
   "Boutique skincare and minimalist beauty routines",
 ];
 
+const PLATFORMS = [
+  { id: "all", label: "All Platforms" },
+  { id: "instagram", label: "Instagram" },
+  { id: "tiktok", label: "TikTok" },
+  { id: "youtube", label: "YouTube" },
+];
+
 export const DiscoverScreen: React.FC<DiscoverScreenProps> = ({
   isStarred,
   onToggleStar,
@@ -29,11 +37,22 @@ export const DiscoverScreen: React.FC<DiscoverScreenProps> = ({
   const [maxFollowers, setMaxFollowers] = useState<string>("");
   const [showFilters, setShowFilters] = useState<boolean>(false);
 
+  // Search state
   const [loading, setLoading] = useState<boolean>(false);
+  const [loadingMore, setLoadingMore] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
-  const [results, setResults] = useState<Creator[] | null>(null);
-  const [searchMeta, setSearchMeta] = useState<{ source?: string; fetched_at?: string } | null>(null);
+  const [results, setResults] = useState<any[] | null>(null);
 
+  // Pagination and metadata state
+  const [hasMore, setHasMore] = useState<boolean>(false);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [quality, setQuality] = useState<{ mode?: string; reason?: string } | null>(null);
+  const [activePlatformFilter, setActivePlatformFilter] = useState<string>("all");
+  const [lastSubmittedQuery, setLastSubmittedQuery] = useState<string>("");
+  const [lastMinFollowers, setLastMinFollowers] = useState<string>("");
+  const [lastMaxFollowers, setLastMaxFollowers] = useState<string>("");
+
+  // Handle initial search submit (runs on submit only, never on keystroke)
   const handleSearch = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     const trimmed = query.trim();
@@ -41,15 +60,23 @@ export const DiscoverScreen: React.FC<DiscoverScreenProps> = ({
 
     setLoading(true);
     setError(null);
+    setResults(null);
+    setHasMore(false);
+    setNextCursor(null);
+    setQuality(null);
+
+    // Save submitted search params for pagination
+    setLastSubmittedQuery(trimmed);
+    setActivePlatformFilter(selectedPlatform);
+    setLastMinFollowers(minFollowers);
+    setLastMaxFollowers(maxFollowers);
 
     try {
-      // Build search payload matching api/creators-search schema
       const payload: Record<string, any> = {
-        query: selectedPlatform !== "all" && selectedPlatform !== "instagram"
-          ? `${trimmed} on ${selectedPlatform}`
-          : trimmed,
+        query: trimmed,
       };
 
+      // Platform filter: pass using parameter name from inputSchema ('platforms')
       if (selectedPlatform === "instagram") {
         payload.platforms = ["instagram"];
       }
@@ -79,32 +106,133 @@ export const DiscoverScreen: React.FC<DiscoverScreenProps> = ({
         throw new Error(errorData.error || `Search failed with status ${response.status}`);
       }
 
-      const resData = json as ApiResponse<any>;
-      const rawData = resData.data;
+      // Unwrapped response structure { data, search_id, total, has_more, next_cursor, quality }
+      const resPayload = json.data || json;
+      const rawList = Array.isArray(resPayload.data)
+        ? resPayload.data
+        : Array.isArray(resPayload)
+        ? resPayload
+        : [];
 
-      // Extract creators array based on possible Influship structures
-      let list: Creator[] = [];
-      if (Array.isArray(rawData)) {
-        list = rawData;
-      } else if (rawData && Array.isArray(rawData.results)) {
-        list = rawData.results;
-      } else if (rawData && Array.isArray(rawData.data)) {
-        list = rawData.data;
-      } else if (rawData && Array.isArray(rawData.creators)) {
-        list = rawData.creators;
-      }
-
-      setResults(list);
-      setSearchMeta({
-        source: resData.source,
-        fetched_at: resData.fetched_at,
-      });
+      setResults(rawList);
+      setHasMore(Boolean(resPayload.has_more));
+      setNextCursor(resPayload.next_cursor || null);
+      setQuality(resPayload.quality || null);
     } catch (err: any) {
       setError(err.message || "An unexpected error occurred during search.");
       setResults(null);
     } finally {
       setLoading(false);
     }
+  };
+
+  // Handle Load More pagination
+  const handleLoadMore = async () => {
+    if (!hasMore || loadingMore || !lastSubmittedQuery) return;
+
+    setLoadingMore(true);
+    setError(null);
+
+    try {
+      const payload: Record<string, any> = {
+        query: lastSubmittedQuery,
+      };
+
+      if (activePlatformFilter === "instagram") {
+        payload.platforms = ["instagram"];
+      }
+
+      const parsedMin = parseInt(lastMinFollowers, 10);
+      if (!isNaN(parsedMin) && parsedMin >= 0) {
+        payload.min_followers = parsedMin;
+      }
+
+      const parsedMax = parseInt(lastMaxFollowers, 10);
+      if (!isNaN(parsedMax) && parsedMax >= 0) {
+        payload.max_followers = parsedMax;
+      }
+
+      // Send next_cursor using cursor parameter name from inputSchema
+      if (nextCursor) {
+        payload.cursor = nextCursor;
+        payload.next_cursor = nextCursor;
+      }
+
+      const response = await fetch("/api/creators-search", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      });
+
+      const json = await response.json();
+
+      if (!response.ok) {
+        const errorData = json as ApiError;
+        throw new Error(errorData.error || `Failed to load more results (${response.status})`);
+      }
+
+      const resPayload = json.data || json;
+      const newItems = Array.isArray(resPayload.data) ? resPayload.data : [];
+
+      // Append new results below existing ones, skipping any creator id already shown
+      setResults((prev) => {
+        const currentList = prev || [];
+        const seenIds = new Set<string>();
+
+        // Collect existing IDs/usernames
+        currentList.forEach((item) => {
+          const norm = normalizeResult(item);
+          if (norm.id) seenIds.add(norm.id);
+          else if (norm.username) seenIds.add(norm.username.toLowerCase());
+        });
+
+        // Filter incoming items
+        const deduplicatedNew = newItems.filter((item: any) => {
+          const norm = normalizeResult(item);
+          if (norm.id && seenIds.has(norm.id)) return false;
+          if (norm.username && seenIds.has(norm.username.toLowerCase())) return false;
+          if (norm.id) seenIds.add(norm.id);
+          else if (norm.username) seenIds.add(norm.username.toLowerCase());
+          return true;
+        });
+
+        return [...currentList, ...deduplicatedNew];
+      });
+
+      setHasMore(Boolean(resPayload.has_more));
+      setNextCursor(resPayload.next_cursor || null);
+      if (resPayload.quality) {
+        setQuality(resPayload.quality);
+      }
+    } catch (err: any) {
+      setError(err.message || "Failed to load additional creators.");
+    } finally {
+      setLoadingMore(false);
+    }
+  };
+
+  // Client-side platform filtering: drop cards whose platform does not match selected filter
+  const displayedResults = useMemo(() => {
+    if (results === null) return null;
+    if (activePlatformFilter === "all") return results;
+
+    return results.filter((item) => {
+      const norm = normalizeResult(item);
+      const p = (norm.platform || "").toLowerCase();
+      return p === activePlatformFilter.toLowerCase();
+    });
+  }, [results, activePlatformFilter]);
+
+  // Ranking notice: when quality.mode is anything other than fully reranked
+  const showRankingNotice = Boolean(
+    quality && quality.mode && quality.mode !== "fully_reranked"
+  );
+
+  const getPlatformLabel = (id: string) => {
+    const found = PLATFORMS.find((p) => p.id === id);
+    return found ? found.label : id;
   };
 
   return (
@@ -120,7 +248,7 @@ export const DiscoverScreen: React.FC<DiscoverScreenProps> = ({
             Describe topics, niches, audience aesthetics, or campaign goals.
           </p>
 
-          {/* Search Form - Submits on form submit only */}
+          {/* Search Form - Submits on form submit only, never on each keystroke */}
           <form onSubmit={handleSearch} className="space-y-3">
             <div className="flex flex-col sm:flex-row gap-2">
               <div className="relative flex-1">
@@ -180,12 +308,7 @@ export const DiscoverScreen: React.FC<DiscoverScreenProps> = ({
             {/* Platform Filter Buttons */}
             <div className="flex flex-wrap items-center gap-2 pt-1">
               <span className="text-xs font-medium text-zinc-400">Platform:</span>
-              {[
-                { id: "all", label: "All Platforms" },
-                { id: "instagram", label: "Instagram" },
-                { id: "tiktok", label: "TikTok" },
-                { id: "youtube", label: "YouTube" },
-              ].map((p) => (
+              {PLATFORMS.map((p) => (
                 <button
                   key={p.id}
                   type="button"
@@ -201,7 +324,7 @@ export const DiscoverScreen: React.FC<DiscoverScreenProps> = ({
               ))}
             </div>
 
-            {/* Expanded Follower Filters */}
+            {/* Collapsible Follower Filters */}
             {showFilters && (
               <div className="pt-3 border-t border-zinc-800 flex flex-wrap items-center gap-4">
                 <div className="flex items-center gap-2">
@@ -244,7 +367,7 @@ export const DiscoverScreen: React.FC<DiscoverScreenProps> = ({
             )}
           </form>
 
-          {/* Quick Query Pills */}
+          {/* Preset discovery briefs */}
           {results === null && !loading && !error && (
             <div className="mt-6">
               <span className="text-xs font-medium text-zinc-500 uppercase tracking-wider block mb-2">
@@ -318,35 +441,38 @@ export const DiscoverScreen: React.FC<DiscoverScreenProps> = ({
         </div>
       )}
 
-      {/* Empty State: Zero Results */}
-      {results !== null && results.length === 0 && !loading && !error && (
+      {/* Empty State: Zero Results (reads exact wording "No creators found. Try a broader brief.") */}
+      {displayedResults !== null && displayedResults.length === 0 && !loading && !error && (
         <div className="flex flex-col items-center justify-center rounded-2xl border border-zinc-800 bg-zinc-900/20 p-12 text-center">
           <Search className="h-8 w-8 text-zinc-500 mb-3" />
           <h3 className="font-semibold text-zinc-300 text-sm">
-            No creators found
+            No creators found. Try a broader brief.
           </h3>
-          <p className="text-xs text-zinc-500 mt-1 max-w-sm">
-            No creators matched your semantic brief or follower constraints. Try widening your filters or rephrasing your search terms.
-          </p>
         </div>
       )}
 
-      {/* Results Grid */}
-      {results !== null && results.length > 0 && !loading && (
-        <div>
-          <div className="flex items-center justify-between mb-4">
-            <h2 className="text-sm font-semibold text-zinc-300">
-              Found {results.length} creator{results.length === 1 ? "" : "s"}
-            </h2>
-            {searchMeta?.fetched_at && (
-              <span className="text-[11px] text-zinc-500">
-                Updated {new Date(searchMeta.fetched_at).toLocaleTimeString()} via {searchMeta.source}
-              </span>
+      {/* Results Header & Grid */}
+      {displayedResults !== null && displayedResults.length > 0 && !loading && (
+        <div className="space-y-4">
+          <div className="space-y-1">
+            {/* Platform filter status label */}
+            {activePlatformFilter !== "all" ? (
+              <div className="text-xs font-semibold text-indigo-400">
+                Filtered to {getPlatformLabel(activePlatformFilter)} profiles
+              </div>
+            ) : null}
+
+            {/* Ranking notice: when quality.mode is anything other than fully reranked */}
+            {showRankingNotice && (
+              <p className="text-xs text-zinc-500">
+                Ranking is approximate for this search.
+              </p>
             )}
           </div>
 
+          {/* Cards Grid */}
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-            {results.map((creator, idx) => (
+            {displayedResults.map((creator, idx) => (
               <CreatorCard
                 key={creator.id || creator.creator_id || creator.username || idx}
                 creator={creator}
@@ -357,6 +483,27 @@ export const DiscoverScreen: React.FC<DiscoverScreenProps> = ({
               />
             ))}
           </div>
+
+          {/* Pagination: Load More button only when has_more is true */}
+          {hasMore && (
+            <div className="pt-4 pb-2 text-center">
+              <button
+                type="button"
+                onClick={handleLoadMore}
+                disabled={loadingMore}
+                className="inline-flex items-center justify-center gap-2 rounded-xl border border-zinc-700 bg-zinc-900 px-6 py-2.5 text-xs sm:text-sm font-semibold text-zinc-200 hover:bg-zinc-800 hover:text-white disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+              >
+                {loadingMore ? (
+                  <>
+                    <Loader2 className="h-4 w-4 animate-spin text-indigo-400" />
+                    <span>Loading more creators...</span>
+                  </>
+                ) : (
+                  <span>Load more</span>
+                )}
+              </button>
+            </div>
+          )}
         </div>
       )}
     </div>
