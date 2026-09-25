@@ -6,6 +6,7 @@ import creatorHandler from "./api/creator.js";
 import creatorPostsHandler from "./api/creator-posts.js";
 import lookalikesHandler from "./api/lookalikes.js";
 import matchHandler from "./api/match.js";
+import mcpHandler from "./api/mcp.js";
 
 dotenv.config();
 
@@ -15,6 +16,9 @@ async function startServer() {
   const port = 3000;
 
   app.use(express.json());
+
+  // MCP Server endpoint supporting Streamable HTTP / SSE / JSON-RPC
+  app.all("/api/mcp", mcpHandler);
 
   // Register API routes directly using imported handlers from api/
   app.post("/api/creators-search", creatorsSearchHandler);
