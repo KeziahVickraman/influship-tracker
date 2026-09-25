@@ -1,0 +1,6 @@
+{
+  "name": "Influencer Discovery Dashboard",
+  "description": "Discover creators, inspect profiles and posts, find lookalikes, and score creator fit against campaign briefs using Influship MCP.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
